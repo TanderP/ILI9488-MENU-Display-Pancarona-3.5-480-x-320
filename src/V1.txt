@@ -1,0 +1,205 @@
+#include <Arduino.h>
+#include "TFT_eSPI.h"
+#include "Tulip Landscape 480x320.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+
+#define BL 4
+#define SCREEN_W 480
+#define SCREEN_H 320
+
+// User-defined tile size
+#define TILE_W (SCREEN_W / 4)
+#define TILE_H (SCREEN_H / 5)
+
+// Automatically calculate number of tiles
+const int NUM_COLS = SCREEN_W / TILE_W;
+const int NUM_ROWS = SCREEN_H / TILE_H;
+
+// Number of parallel sections
+#define NUM_SECTIONS 4
+
+
+TFT_eSPI tft = TFT_eSPI();
+
+// Sprites for each section
+TFT_eSprite sprites[NUM_SECTIONS] = {
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft)
+};
+
+// Task handles
+TaskHandle_t tileTaskHandles[NUM_SECTIONS];
+
+// Synchronization
+SemaphoreHandle_t renderCompleteSemaphore;
+SemaphoreHandle_t tftMutex;
+
+unsigned long lastFrameTime = 0;  // For measuring frame time
+float fps = 0.0;                  // FPS value
+
+// Structure to pass data to tasks
+struct TileTaskData {
+  int sectionId;
+  int startRow;
+  int endRow;
+};
+
+TileTaskData taskData[NUM_SECTIONS];
+
+uint16_t getTileColor(int tileX, int tileY) {
+  uint8_t r = (tileX * 70) % 256;
+  uint8_t g = (tileY * 120) % 256;
+  uint8_t b = (tileX * tileY * 45) % 256;
+  return tft.color565(r, g, b);
+}
+
+void tileRenderTask(void* parameter) {
+  TileTaskData* data = (TileTaskData*)parameter;
+  int sectionId = data->sectionId;
+  
+  sprites[sectionId].setColorDepth(16);
+  sprites[sectionId].createSprite(TILE_W, TILE_H);
+  
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // Wait for start signal
+    
+    int screenCenterX = SCREEN_W / 2;
+    int screenCenterY = SCREEN_H / 2;
+    
+    for (int ty = 0; ty < NUM_ROWS; ty++) {
+      for (int tx = 0; tx < NUM_COLS; tx++) {
+
+        // Assign tile to this task based on checkerboard rule
+        if ((tx + ty) % NUM_SECTIONS != sectionId) continue;
+
+        int screenX = tx * TILE_W;
+        int screenY = ty * TILE_H;
+
+        // Fill tile sprite
+        sprites[sectionId].fillSprite(TFT_BLACK);
+        for (int y = 0; y < TILE_H; y++) {
+          for (int x = 0; x < TILE_W; x++) {
+           
+           uint16_t color = image_data_TulipLandscape480x320[(y + ty * TILE_H) * SCREEN_W + (x + tx * TILE_W)];
+            //uint16_t color = getTileColor(screenY, screenX);
+            sprites[sectionId].drawPixel(x, y, color);
+          }
+        }
+
+        // Centered text
+        int centerX = screenCenterX - screenX;
+        int centerY = screenCenterY - screenY;
+
+        if (centerX >= -240 && centerX <= TILE_W + 240 &&
+            centerY >= -240 && centerY <= TILE_H + 240)
+        { 
+          int number;
+          sprites[sectionId].setTextDatum(MC_DATUM);
+          sprites[sectionId].setFreeFont(&FreeSansBoldOblique24pt7b);
+          sprites[sectionId].setTextColor(TFT_WHITE);
+          sprites[sectionId].drawString("Hello World", centerX, centerY+40);
+          //sprites[sectionId].drawString("a", centerX, centerY);
+        
+
+          char numStr[10];
+          snprintf(numStr, sizeof(numStr), "%02d",number);
+          sprites[sectionId].drawString(numStr, centerX, centerY);
+        number ++;
+        /// day  U
+        }
+
+        // Push to screen safely
+        if (xSemaphoreTake(tftMutex, portMAX_DELAY) == pdTRUE) {
+          sprites[sectionId].pushSprite(screenX, screenY);
+          xSemaphoreGive(tftMutex);
+        }
+      }
+    }
+    
+    xSemaphoreGive(renderCompleteSemaphore);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BL, OUTPUT);
+  digitalWrite(BL, HIGH);
+  tft.init();
+  tft.setRotation(1);
+  tft.setSwapBytes(true);
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Starting parallel tile rendering...", 10, 10, 2);
+  
+
+
+
+  // Create semaphores
+  renderCompleteSemaphore = xSemaphoreCreateCounting(NUM_SECTIONS, 0);
+  tftMutex = xSemaphoreCreateMutex();
+  
+  // Calculate rows per section
+  int rowsPerSection = NUM_ROWS / NUM_SECTIONS;
+  int remainingRows = NUM_ROWS % NUM_SECTIONS;
+  
+  // Create tasks for each section
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    taskData[i].sectionId = i;
+    taskData[i].startRow = i * rowsPerSection;
+    taskData[i].endRow = (i + 1) * rowsPerSection;
+    
+    // Add remaining rows to the last section
+    if (i == NUM_SECTIONS - 1) {
+      taskData[i].endRow += remainingRows;
+    }
+    
+    String taskName = "TileTask" + String(i);
+    xTaskCreatePinnedToCore(
+      tileRenderTask,           // Task function
+      taskName.c_str(),         // Task name
+      4096,                     // Stack size
+      &taskData[i],             // Parameters
+      1,                        // Priority
+      &tileTaskHandles[i],      // Task handle
+      i % 2                     // Core (alternate between core 0 and 1)
+    );
+    
+    Serial.println("Created " + taskName + " for rows " + 
+                   String(taskData[i].startRow) + " to " + 
+                   String(taskData[i].endRow - 1));
+  }
+  
+  delay(1000); // Give tasks time to initialize
+  Serial.println("Parallel tile rendering system initialized!");
+}
+
+void loop() {
+  unsigned long frameStart = millis();  // Start timing
+
+  // Signal all tasks to start rendering
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    xTaskNotifyGive(tileTaskHandles[i]);
+  }
+  
+  // Wait for all tasks to complete
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    xSemaphoreTake(renderCompleteSemaphore, portMAX_DELAY);
+  }
+
+  // Calculate FPS
+  unsigned long frameEnd = millis();
+  unsigned long frameTime = frameEnd - frameStart;
+  fps = 1000.0 / (float)frameTime;
+  Serial.println("Parallel rendering: " + String(fps, 1) + " FPS");
+  
+  // Small delay to prevent overwhelming the system
+ // vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+

@@ -1,0 +1,226 @@
+#include <Arduino.h>
+#include "TFT_eSPI.h"
+#include "Tulip Landscape 480x320.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <vector>
+
+#define BL 4
+#define SCREEN_W 480
+#define SCREEN_H 320
+
+// Tile size
+#define TILE_W (SCREEN_W / 2)
+#define TILE_H (SCREEN_H / 4)
+
+// Number of tiles
+const int NUM_COLS = SCREEN_W / TILE_W;
+const int NUM_ROWS = SCREEN_H / TILE_H;
+
+// Parallel sections
+#define NUM_SECTIONS 4
+
+struct TextItem {
+  String text;
+  int x;
+  int y;
+};
+
+std::vector<TextItem> textQueue;
+const uint16_t *currentBackground = nullptr;  // Active background image
+
+TFT_eSPI tft = TFT_eSPI();
+
+// Each section has its own sprite
+TFT_eSprite sprites[NUM_SECTIONS] = {
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft),
+  TFT_eSprite(&tft)
+};
+
+// FreeRTOS handles
+TaskHandle_t tileTaskHandles[NUM_SECTIONS];
+SemaphoreHandle_t renderCompleteSemaphore;
+SemaphoreHandle_t tftMutex;
+
+float fps = 0.0;
+
+struct TileTaskData {
+  int sectionId;
+  int startRow;
+  int endRow;
+};
+
+TileTaskData taskData[NUM_SECTIONS];
+
+// === Utility ===
+uint16_t getTileColor(int tileX, int tileY) {
+  uint8_t r = (tileX * 70) % 256;
+  uint8_t g = (tileY * 120) % 256;
+  uint8_t b = (tileX * tileY * 45) % 256;
+  return tft.color565(r, g, b);
+}
+
+void drawBackground(const uint16_t *image) {
+  currentBackground = image;
+}
+
+void drawText(String text, int x, int y) {
+  textQueue.push_back({text, x, y});
+}
+
+void sendText(int id, int baseX, int baseY) {
+  sprites[id].setTextDatum(MC_DATUM);
+  sprites[id].setFreeFont(&FreeSansBoldOblique24pt7b);
+  sprites[id].setTextColor(TFT_WHITE);
+
+  for (auto &item : textQueue) {
+    sprites[id].drawString(item.text, baseX + item.x, baseY + item.y);
+  }
+}
+
+// === Parallel Tile Rendering Task ===
+void tileRenderTask(void *parameter) {
+  TileTaskData *data = (TileTaskData *)parameter;
+  int sectionId = data->sectionId;
+
+  sprites[sectionId].setColorDepth(16);
+  sprites[sectionId].createSprite(TILE_W, TILE_H);
+
+  while (true) {
+    // Wait until main loop triggers render
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // Iterate only over this section's assigned rows
+    for (int ty = data->startRow; ty < data->endRow; ty++) {
+      for (int tx = 0; tx < NUM_COLS; tx++) {
+        int screenX = tx * TILE_W;
+        int screenY = ty * TILE_H;
+
+        // Get direct sprite buffer
+        uint16_t *buf = (uint16_t *)sprites[sectionId].getPointer();
+
+        if (currentBackground) {
+          // Copy background image section (with byte swap fix)
+          const uint16_t *src = &currentBackground[(ty * TILE_H) * SCREEN_W + (tx * TILE_W)];
+          for (int y = 0; y < TILE_H; y++) {
+            for (int x = 0; x < TILE_W; x++) {
+              uint16_t pixel = src[y * SCREEN_W + x];
+              buf[y * TILE_W + x] = (pixel >> 8) | (pixel << 8); // fix color order
+            }
+          }
+        } else {
+          // Fallback gradient background
+          for (int y = 0; y < TILE_H; y++) {
+            for (int x = 0; x < TILE_W; x++) {
+              buf[y * TILE_W + x] = getTileColor(screenX + x, screenY + y);
+            }
+          }
+        }
+
+        // Draw text only if within screen center region
+        int centerX = (SCREEN_W / 2) - screenX;
+        int centerY = (SCREEN_H / 2) - screenY;
+        if (abs(centerX) < SCREEN_W && abs(centerY) < SCREEN_H) {
+          sendText(sectionId, centerX, centerY);
+        }
+
+        // Push tile sprite to TFT safely
+        if (xSemaphoreTake(tftMutex, portMAX_DELAY) == pdTRUE) {
+          sprites[sectionId].pushSprite(screenX, screenY);
+          xSemaphoreGive(tftMutex);
+        }
+      }
+    }
+
+    // Notify main thread that this section finished rendering
+    xSemaphoreGive(renderCompleteSemaphore);
+  }
+}
+
+// === Render Trigger ===
+void drawRender() {
+  // Signal all tasks to start rendering
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    xTaskNotifyGive(tileTaskHandles[i]);
+  }
+
+  // Wait until all tasks finish
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    xSemaphoreTake(renderCompleteSemaphore, portMAX_DELAY);
+  }
+
+  // Clear queued text after rendering
+  textQueue.clear();
+}
+
+// === Setup FreeRTOS tasks ===
+void drawSetup() {
+  renderCompleteSemaphore = xSemaphoreCreateCounting(NUM_SECTIONS, 0);
+  tftMutex = xSemaphoreCreateMutex();
+
+  int rowsPerSection = NUM_ROWS / NUM_SECTIONS;
+  int remainingRows = NUM_ROWS % NUM_SECTIONS;
+
+  for (int i = 0; i < NUM_SECTIONS; i++) {
+    taskData[i].sectionId = i;
+    taskData[i].startRow = i * rowsPerSection;
+    taskData[i].endRow   = (i + 1) * rowsPerSection;
+    if (i == NUM_SECTIONS - 1) {
+      taskData[i].endRow += remainingRows; // last task takes extra rows if any
+    }
+
+    String taskName = "TileTask" + String(i);
+    xTaskCreatePinnedToCore(
+      tileRenderTask,           // Task function
+      taskName.c_str(),         // Name
+      4096,                     // Stack size
+      &taskData[i],             // Parameters
+      1,                        // Priority
+      &tileTaskHandles[i],      // Handle
+      i % 2                     // Alternate cores
+    );
+
+    Serial.printf("Created %s for rows %d - %d\n", 
+      taskName.c_str(), taskData[i].startRow, taskData[i].endRow - 1);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BL, OUTPUT);
+  digitalWrite(BL, HIGH);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.setSwapBytes(true);
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Starting parallel tile rendering...", 10, 10, 2);
+
+  drawSetup();
+
+  delay(500);
+  Serial.println("Parallel tile rendering system initialized!");
+}
+
+void loop() {
+  unsigned long frameStart = millis();
+
+  // Example usage
+  drawBackground(image_data_TulipLandscape480x320);
+  drawText("WORLD", 0, 40);
+  drawRender();
+
+  // FPS calculation
+  unsigned long frameEnd = millis();
+  unsigned long frameTime = frameEnd - frameStart;
+  fps = 1000.0 / (float)frameTime;
+  Serial.printf("Parallel rendering: %.1f FPS\n", fps);
+
+  vTaskDelay(pdMS_TO_TICKS(50)); // small delay
+}
