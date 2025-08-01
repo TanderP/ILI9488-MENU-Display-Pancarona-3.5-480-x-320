@@ -12,19 +12,26 @@
 #include "NimbusSanL_Bol20pt7b.h"
 //#include "texgyreheros_bold12pt7b.h"
 #define BL 4
-#define SCREEN_W 320
-#define SCREEN_H 480
+int SCREEN_W;
+int SCREEN_H;
 
-#define TILE_W (SCREEN_W / 4)
-#define TILE_H (SCREEN_H /  2)
+int dividerW;
+int dividerH;
 
-const int NUM_COLS = SCREEN_W / TILE_W;
-const int NUM_ROWS = SCREEN_H / TILE_H;
+int TILE_W;
+int TILE_H;
+
+int NUM_COLS;
+int NUM_ROWS;
+bool renderVertically = true; // default: render downwards like a column
+
 
 #define NUM_SECTIONS 4
 
+
+
 struct TextItem {
-  String text;
+  String text; 
   int x;
   int y;
 };
@@ -67,10 +74,13 @@ float fps = 0.0;
 
 struct TileTaskData {
   int sectionId;
-  int startCol;
-  int endCol;
+  int start;
+  int end;
 };
 
+void setRenderDirection(bool vertical) {
+  renderVertically = vertical;
+}
 TileTaskData taskData[NUM_SECTIONS];
 
 // === Utility ===
@@ -224,48 +234,84 @@ void tileRenderTask(void *parameter) {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    for (int tx = data->startCol; tx < data->endCol; tx++) {
-      for (int ty = 0; ty < NUM_ROWS; ty++) {
-        int screenX = tx * TILE_W;
-        int screenY = ty * TILE_H;
+    if (renderVertically) {
+      for (int ty = data->start; ty < data->end; ty++) {
+        for (int tx = 0; tx < NUM_COLS; tx++) {
+          int screenX = tx * TILE_W;
+          int screenY = ty * TILE_H;
 
-        uint16_t *buf = (uint16_t *)sprites[sectionId].getPointer();
+          uint16_t *buf = (uint16_t *)sprites[sectionId].getPointer();
 
-        if (currentBackground) {
-          const uint16_t *src = &currentBackground[(ty * TILE_H) * SCREEN_W + (tx * TILE_W)];
-          for (int y = 0; y < TILE_H; y++) {
-            for (int x = 0; x < TILE_W; x++) {
-              uint16_t pixel = src[y * SCREEN_W + x];
-              buf[y * TILE_W + x] = (pixel >> 8) | (pixel << 8);
+          if (currentBackground) {
+            const uint16_t *src = &currentBackground[(ty * TILE_H) * SCREEN_W + (tx * TILE_W)];
+            for (int y = 0; y < TILE_H; y++) {
+              for (int x = 0; x < TILE_W; x++) {
+                uint16_t pixel = src[y * SCREEN_W + x];
+                buf[y * TILE_W + x] = (pixel >> 8) | (pixel << 8);
+              }
+            }
+          } else {
+            for (int y = 0; y < TILE_H; y++) {
+              for (int x = 0; x < TILE_W; x++) {
+                buf[y * TILE_W + x] = getTileColor(screenX + x, screenY + y);
+              }
             }
           }
-        } else {
-          for (int y = 0; y < TILE_H; y++) {
-            for (int x = 0; x < TILE_W; x++) {
-              buf[y * TILE_W + x] = getTileColor(screenX + x, screenY + y);
-            }
+
+          int centerX = (SCREEN_W / 2) - screenX;
+          int centerY = (SCREEN_H / 2) - screenY;
+          if (abs(centerX) < SCREEN_W && abs(centerY) < SCREEN_H) {
+            sendGraphics(sectionId, centerX, centerY);
+          }
+
+          if (xSemaphoreTake(tftMutex, portMAX_DELAY) == pdTRUE) {
+            sprites[sectionId].pushSprite(screenX, screenY);
+            xSemaphoreGive(tftMutex);
           }
         }
+      }
+    } else {
+      for (int tx = data->start; tx < data->end; tx++) {
+        for (int ty = 0; ty < NUM_ROWS; ty++) {
+          int screenX = tx * TILE_W;
+          int screenY = ty * TILE_H;
 
-        int centerX = (SCREEN_W / 2) - screenX;
-        int centerY = (SCREEN_H / 2) - screenY;
-        if (abs(centerX) < SCREEN_W && abs(centerY) < SCREEN_H) {
+          uint16_t *buf = (uint16_t *)sprites[sectionId].getPointer();
 
-          sendGraphics(sectionId, centerX, centerY);
+          if (currentBackground) {
+            const uint16_t *src = &currentBackground[(ty * TILE_H) * SCREEN_W + (tx * TILE_W)];
+            for (int y = 0; y < TILE_H; y++) {
+              for (int x = 0; x < TILE_W; x++) {
+                uint16_t pixel = src[y * SCREEN_W + x];
+                buf[y * TILE_W + x] = (pixel >> 8) | (pixel << 8);
+              }
+            }
+          } else {
+            for (int y = 0; y < TILE_H; y++) {
+              for (int x = 0; x < TILE_W; x++) {
+                buf[y * TILE_W + x] = getTileColor(screenX + x, screenY + y);
+              }
+            }
+          }
 
+          int centerX = (SCREEN_W / 2) - screenX;
+          int centerY = (SCREEN_H / 2) - screenY;
+          if (abs(centerX) < SCREEN_W && abs(centerY) < SCREEN_H) {
+            sendGraphics(sectionId, centerX, centerY);
+          }
+
+          if (xSemaphoreTake(tftMutex, portMAX_DELAY) == pdTRUE) {
+            sprites[sectionId].pushSprite(screenX, screenY);
+            xSemaphoreGive(tftMutex);
+          }
         }
-
-        if (xSemaphoreTake(tftMutex, portMAX_DELAY) == pdTRUE) {
-          sprites[sectionId].pushSprite(screenX, screenY);
-          xSemaphoreGive(tftMutex);
-        }
-
       }
     }
 
     xSemaphoreGive(renderCompleteSemaphore);
   }
 }
+
 
 void drawRender() {
   for (int i = 0; i < NUM_SECTIONS; i++) {
@@ -285,19 +331,31 @@ void drawRender() {
 
 }
 
-void drawSetup() {
+void drawSetup(int screenW , int screenH, int divW , int divH ) {
+  SCREEN_W = screenW;
+  SCREEN_H = screenH;
+  dividerW = divW;
+  dividerH = divH;
+
+  TILE_W = SCREEN_W / dividerW;
+  TILE_H = SCREEN_H / dividerH;
+
+  NUM_COLS = SCREEN_W / TILE_W;
+  NUM_ROWS = SCREEN_H / TILE_H;
+
   renderCompleteSemaphore = xSemaphoreCreateCounting(NUM_SECTIONS, 0);
   tftMutex = xSemaphoreCreateMutex();
 
-  int colsPerSection = NUM_COLS / NUM_SECTIONS;
-  int remainingCols = NUM_COLS % NUM_SECTIONS;
+  int totalTiles = renderVertically ? NUM_ROWS : NUM_COLS;
+  int perSection = totalTiles / NUM_SECTIONS;
+  int extra = totalTiles % NUM_SECTIONS;
 
   for (int i = 0; i < NUM_SECTIONS; i++) {
     taskData[i].sectionId = i;
-    taskData[i].startCol = i * colsPerSection;
-    taskData[i].endCol = (i + 1) * colsPerSection;
+    taskData[i].start = i * perSection;
+    taskData[i].end = (i + 1) * perSection;
     if (i == NUM_SECTIONS - 1) {
-      taskData[i].endCol += remainingCols;
+      taskData[i].end += extra;
     }
 
     String taskName = "TileTask" + String(i);
@@ -311,10 +369,16 @@ void drawSetup() {
       i % 2
     );
 
-    Serial.printf("Created %s for cols %d - %d\n",
-                  taskName.c_str(), taskData[i].startCol, taskData[i].endCol - 1);
+    Serial.printf("Created %s for %s %d - %d\n",
+      taskName.c_str(),
+      renderVertically ? "rows" : "cols",
+      taskData[i].start,
+      taskData[i].end - 1
+    );
   }
 }
+
+
 
 void setup() {
   Serial.begin(115200);
@@ -330,7 +394,8 @@ void setup() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Starting vertical tile rendering...", 10, 10, 2);
 
-  drawSetup();
+   setRenderDirection(false); // true = vertical rendering
+  drawSetup(320,480,4,2);
 
   delay(500);
   Serial.println("Vertical tile rendering system initialized!");
